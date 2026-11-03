@@ -198,8 +198,7 @@ esp_err_t esp_modem_set_urc(esp_modem_dce_t *dce, esp_err_t(*got_line_cb)(uint8_
 /**
  * @brief Writes raw bytes to the modem's command channel
  *
- * Local addition (see VENDORED.md): the C API otherwise carries only
- * NUL-terminated command strings. A prompt-driven upload such as the payload
+ * The C API otherwise carries only NUL-terminated command strings. A prompt-driven upload such as the payload
  * after AT+CCHSEND's '>' needs arbitrary bytes. The DCE must be in command
  * mode (or CMUX manual command mode); the caller sequences the prompt and the
  * final result through esp_modem_command().
