@@ -157,7 +157,7 @@ void UartTerminal::task()
         return; // exits to the static method where the task gets deleted
     }
     while (signal.is_any(TASK_START)) {
-        if (get_event(event, 100)) {
+        if (get_event(event, CONFIG_ESP_MODEM_UART_TERMINAL_POLL_MS)) {
             switch (event.type) {
             case UART_DATA:
                 uart_get_buffered_data_len(uart.port, &len);

@@ -85,6 +85,18 @@ menu "esp-modem"
         help
             If enabled, APIs to add URC handler are available
 
+    config ESP_MODEM_UART_TERMINAL_POLL_MS
+        int "UART terminal event poll period (ms)"
+        default 100
+        range 10 60000
+        help
+            The UART terminal task waits this long for a driver event before it
+            re-checks the receive buffer and its stop request. Each expiry wakes
+            the CPU, so on a host that light-sleeps between modem transfers a
+            longer period lets it sleep longer; incoming bytes still wake the
+            task immediately through the driver's event queue. A lost driver
+            event is recovered no later than one period after it.
+
     config ESP_MODEM_PPP_ESCAPE_BEFORE_EXIT
         bool "Send escape sequence when switching PPP -> CMD"
         default n
