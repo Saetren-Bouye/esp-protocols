@@ -20,7 +20,11 @@
 #include "esp_timer.h"
 #include "esp_tls_crypto.h"
 #include "esp_system.h"
+#include "esp_vfs_eventfd.h"
 #include <errno.h>
+#include <limits.h>
+#include <unistd.h>
+#include <sys/select.h>
 #include <arpa/inet.h>
 
 static const char *TAG = "websocket_client";
@@ -39,6 +43,7 @@ static const char *TAG = "websocket_client";
 #define WEBSOCKET_KEEP_ALIVE_IDLE       (5)
 #define WEBSOCKET_KEEP_ALIVE_INTERVAL   (5)
 #define WEBSOCKET_KEEP_ALIVE_COUNT      (3)
+#define WEBSOCKET_POLL_READ_MS          (1000)
 
 #ifdef CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK
 #define WEBSOCKET_TX_LOCK_TIMEOUT_MS    (CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS)
@@ -160,11 +165,117 @@ struct esp_websocket_client {
     int                         close_status_code;  /*!< Status code from the last received CLOSE frame (0 = none / client-initiated) */
     esp_transport_keep_alive_t  keep_alive_cfg;
     struct ifreq                *if_name;
+    int                         wake_fd;            /*!< eventfd that ends the connected task's wait early, -1 if unavailable */
 };
 
 static uint64_t _tick_get_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+/**
+ * @brief End the connected task's wait for socket data
+ *
+ * Called by whoever changes something the waiting task does not learn from the socket:
+ * a stop request, a connection aborted from a sending task, a started close handshake or
+ * a new ping interval. The descriptor stays readable until the task consumes it, so a
+ * wake-up issued before the task starts waiting is not lost.
+ */
+static void esp_websocket_client_wake(esp_websocket_client_handle_t client)
+{
+    if (client->wake_fd >= 0) {
+        const uint64_t one = 1;
+        if (write(client->wake_fd, &one, sizeof(one)) != sizeof(one)) {
+            ESP_LOGW(TAG, "Wake-up of the websocket task failed, errno=%d", errno);
+        }
+    }
+}
+
+static uint64_t esp_websocket_client_ms_until_exceeded(uint64_t elapsed_ms, uint64_t limit_ms)
+{
+    /* The task acts once the elapsed time exceeds the limit */
+    return elapsed_ms > limit_ms ? 0 : limit_ms - elapsed_ms + 1;
+}
+
+/**
+ * @brief Time until the connected task has ping or pong work
+ *
+ * Uses the same expressions as the checks in the task loop, so the wait ends exactly
+ * when one of them becomes true.
+ *
+ * @note PRECONDITION: client->lock MUST be held by the calling thread.
+ */
+static int esp_websocket_client_idle_wait_ms(esp_websocket_client_handle_t client)
+{
+    if (CLOSE_FRAME_SENT_BIT & xEventGroupGetBits(client->status_bits)) {
+        /* A close handshake has no deadline of its own; it stays polled */
+        return WEBSOCKET_POLL_READ_MS;
+    }
+    const uint64_t now_ms = _tick_get_ms();
+    uint64_t wait_ms = esp_websocket_client_ms_until_exceeded(now_ms - client->ping_tick_ms,
+                                                              client->config->ping_interval_sec * 1000);
+    if (client->wait_for_pong_resp && client->config->pingpong_timeout_sec) {
+        const uint64_t pong_ms = esp_websocket_client_ms_until_exceeded(now_ms - client->pingpong_tick_ms,
+                                                                        client->config->pingpong_timeout_sec * 1000);
+        if (pong_ms < wait_ms) {
+            wait_ms = pong_ms;
+        }
+    }
+    return wait_ms > INT_MAX ? INT_MAX : (int)wait_ms;
+}
+
+/**
+ * @brief Wait until the transport has data to read, a wake-up arrives or the timeout elapses
+ *
+ * Blocks on the socket together with the client's wake-up descriptor, so the wait can
+ * be as long as the next ping or pong deadline. Without a wake-up descriptor or a plain
+ * socket (eventfd not registered, custom transport) it polls the transport as before.
+ *
+ * @return same as esp_transport_poll_read(); 0 also when woken up
+ */
+static int esp_websocket_client_wait_readable(esp_websocket_client_handle_t client, int timeout_ms)
+{
+    const int poll_ms = timeout_ms < WEBSOCKET_POLL_READ_MS ? timeout_ms : WEBSOCKET_POLL_READ_MS;
+    const int sock = client->wake_fd < 0 ? -1 : esp_transport_get_socket(client->transport);
+    if (sock < 0 || sock >= FD_SETSIZE || client->wake_fd >= FD_SETSIZE) {
+        return esp_transport_poll_read(client->transport, poll_ms);
+    }
+
+    /* Data the transport has already buffered is not visible on the socket */
+    int ready = esp_transport_poll_read(client->transport, 0);
+    if (ready != 0 || timeout_ms <= 0) {
+        return ready;
+    }
+
+    fd_set readset;
+    fd_set errset;
+    FD_ZERO(&readset);
+    FD_ZERO(&errset);
+    FD_SET(sock, &readset);
+    FD_SET(client->wake_fd, &readset);
+    FD_SET(sock, &errset);
+    struct timeval timeout = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+    const int max_fd = sock > client->wake_fd ? sock : client->wake_fd;
+    ready = select(max_fd + 1, &readset, NULL, &errset, &timeout);
+    if (ready == 0) {
+        return 0;
+    }
+    if (ready > 0 && FD_ISSET(client->wake_fd, &readset)) {
+        uint64_t wakeups;
+        (void)read(client->wake_fd, &wakeups, sizeof(wakeups));
+        /* The task loop looks at what changed; pending socket data is found by its next wait */
+        return 0;
+    }
+    if (esp_transport_get_socket(client->transport) != sock) {
+        /* A sender closed the connection meanwhile; the task loop sees the new state */
+        return 0;
+    }
+    /* The transport classifies readable versus failed and records the socket error. A failed
+     * select() is not necessarily a socket failure, so that case stays a bounded poll. */
+    return esp_transport_poll_read(client->transport, ready > 0 ? 0 : poll_ms);
 }
 
 static esp_err_t esp_websocket_new_buf(esp_websocket_client_handle_t client, bool is_tx)
@@ -281,6 +392,10 @@ static esp_err_t esp_websocket_client_abort_connection(esp_websocket_client_hand
     }
     client->error_handle.error_type = error_type;
     esp_websocket_client_dispatch_event(client, WEBSOCKET_EVENT_DISCONNECTED, NULL, 0);
+    if (xTaskGetCurrentTaskHandle() != client->task_handle) {
+        /* A sender aborted the connection the task is still waiting on */
+        esp_websocket_client_wake(client);
+    }
 
 cleanup:
     if (client->errormsg_buffer) {
@@ -531,6 +646,10 @@ static void destroy_and_free_resources(esp_websocket_client_handle_t client)
         free(client->errormsg_buffer);
         client->errormsg_buffer = NULL;
     }
+    if (client->wake_fd >= 0) {
+        close(client->wake_fd);
+        client->wake_fd = -1;
+    }
     if (client->status_bits) {
         vEventGroupDelete(client->status_bits);
         client->status_bits = NULL;
@@ -550,6 +669,7 @@ static esp_err_t stop_wait_task(esp_websocket_client_handle_t client)
 
     client->run = false;
     xEventGroupSetBits(client->status_bits, REQUESTED_STOP_BIT);
+    esp_websocket_client_wake(client);
     xEventGroupWaitBits(client->status_bits, STOPPED_BIT, false, true, portMAX_DELAY);
     client->state = WEBSOCKET_STATE_UNKNOW;
     return ESP_OK;
@@ -787,6 +907,7 @@ esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_clie
 {
     esp_websocket_client_handle_t client = calloc(1, sizeof(struct esp_websocket_client));
     ESP_WS_CLIENT_MEM_CHECK(TAG, client, return NULL);
+    client->wake_fd = -1;
 
     esp_event_loop_args_t event_args = {
         .queue_size = WEBSOCKET_EVENT_QUEUE_SIZE,
@@ -814,6 +935,12 @@ esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_clie
 
     client->lock = xSemaphoreCreateRecursiveMutex();
     ESP_WS_CLIENT_MEM_CHECK(TAG, client->lock, goto _websocket_init_fail);
+
+    client->wake_fd = eventfd(0, 0);
+    if (client->wake_fd < 0) {
+        /* The application has not called esp_vfs_eventfd_register(), or its descriptors are used up */
+        ESP_LOGW(TAG, "No eventfd for task wake-up (errno=%d), polling the socket every %d ms", errno, WEBSOCKET_POLL_READ_MS);
+    }
 
 #ifdef CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK
     client->tx_lock = xSemaphoreCreateRecursiveMutex();
@@ -1367,9 +1494,14 @@ static void esp_websocket_client_task(void *pv)
             ESP_LOGD(TAG, "Client run iteration in a default state: %d", client->state);
             break;
         }
+        int idle_wait_ms = 0;
+        if (WEBSOCKET_STATE_CONNECTED == client->state) {
+            idle_wait_ms = esp_websocket_client_idle_wait_ms(client);
+        }
         xSemaphoreGiveRecursive(client->lock);
         if (WEBSOCKET_STATE_CONNECTED == client->state) {
-            read_select = esp_transport_poll_read(client->transport, 1000); //Poll every 1000ms
+            // Sleep until data, a wake-up or the next ping/pong deadline
+            read_select = esp_websocket_client_wait_readable(client, idle_wait_ms);
             if (read_select < 0) {
                 xSemaphoreTakeRecursive(client->lock, lock_timeout);
                 esp_tls_error_handle_t error_handle = esp_transport_get_error_handle(client->transport);
@@ -1544,6 +1676,8 @@ static esp_err_t esp_websocket_client_close_with_optional_body(esp_websocket_cli
 
     // Set closing bit to prevent from sending PING frames while connected
     xEventGroupSetBits(client->status_bits, CLOSE_FRAME_SENT_BIT);
+    // The task may be waiting for its next ping; the close handshake is polled
+    esp_websocket_client_wake(client);
 
     // When auto_reconnect and close_reconnect are both enabled, the task thread owns the
     // close handshake and will reconnect autonomously. Return immediately; do not wait for
@@ -1560,6 +1694,7 @@ static esp_err_t esp_websocket_client_close_with_optional_body(esp_websocket_cli
     // If could not close gracefully within timeout, stop the client and disconnect
     client->run = false;
     xEventGroupSetBits(client->status_bits, REQUESTED_STOP_BIT);
+    esp_websocket_client_wake(client);
     xEventGroupWaitBits(client->status_bits, STOPPED_BIT, false, true, portMAX_DELAY);
     client->state = WEBSOCKET_STATE_UNKNOW;
     return ESP_OK;
@@ -1646,6 +1781,8 @@ esp_err_t esp_websocket_client_set_ping_interval_sec(esp_websocket_client_handle
     }
 
     client->config->ping_interval_sec = ping_interval_sec == 0 ? WEBSOCKET_PING_INTERVAL_SEC : ping_interval_sec;
+    // The task may be waiting for a ping that is now due earlier
+    esp_websocket_client_wake(client);
 
     return ESP_OK;
 }
